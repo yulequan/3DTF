@@ -1,22 +1,30 @@
 import numpy as np
-import copy
 import time
 import nibabel as nib
 import medpy.metric.binary as metric
 import os
 from glob import glob
-
+import pickle
 
 def eval_model():
     testdata_dir = '/home/lqyu/server/gpu8/BRATS2017/data/Brats17TrainingData'
-    labeling_dir = '/home/lqyu/server/gpu8/BRATS2017/data/result_s_avg_ori'
+    labeling_dir = '/home/lqyu/server/gpu8/BRATS2017/result/Dense_feat_ori'
 
     pair_list = glob('{}/*/*/*_seg.nii.gz'.format(testdata_dir))
     pair_list.sort()
 
+    division = pickle.load(open(os.path.join(testdata_dir, 'division.pkl'), 'rb'))
+    train_list, val_list = division
+    list = val_list
+
+
     results = []
-    for id, seg_path in enumerate(pair_list[::5]):
+    for id, seg_path in enumerate(pair_list):
         start = time.time()
+        subject_name = seg_path[:-11]
+        if subject_name.split('/')[-1] not in list:
+            continue
+
         gt = nib.load(seg_path).get_data()
         pred_path = os.path.join(labeling_dir, seg_path.split('/')[-1])
         pred = nib.load(pred_path).get_data()

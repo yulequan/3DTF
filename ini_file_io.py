@@ -20,7 +20,6 @@ def load_train_ini(ini_file):
                           resize_r      = cf.getfloat(s[d], "resize_r"),
                           traindata_dir = cf.get(s[d], "traindata_dir"),
                           learning_rate = cf.getfloat(s[d], "learning_rate"),
-                          beta1         = cf.getfloat(s[d], "beta1"),
                           epoch         = cf.getint(s[d], "epoch"),
                           model_name    = cf.get(s[d], "model_name"),
                           save_intval   = cf.getint(s[d], "save_intval"),

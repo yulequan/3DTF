@@ -6,21 +6,21 @@ import numpy as np
 # 3d functions
 #######################
 # convolution
-def conv3d(input, output_chn, kernel_size, stride, data_format='channels_last', use_bias=False, name='conv'):
+def conv3d(input, output_chn, kernel_size, stride=1, data_format='channels_last', use_bias=False, name='conv'):
     return tf.layers.conv3d(inputs=input, filters=output_chn, kernel_size=kernel_size, strides=stride,
                             padding='same', data_format=data_format,
                             kernel_initializer=tf.truncated_normal_initializer(0.0, 0.01),
                             use_bias=use_bias, name=name)
 
 
-def conv3d_bn_relu(input, output_chn, kernel_size, stride, channel_dim =4, use_bias=False, training=True, name='conv'):
+def conv3d_bn_relu(input, output_chn, kernel_size, stride, channel_dim =-1, use_bias=False, training=True, name='conv'):
     if channel_dim==1:
         data_format = 'channels_first'
     else:
         data_format ='channels_last'
     with tf.variable_scope(name):
         conv = conv3d(input, output_chn, kernel_size, stride, data_format, use_bias, name='conv')
-        bn = tf.layers.batch_normalization(conv, axis=channel_dim, training=training, name='bn')
+        bn = tf.layers.batch_normalization(conv, momentum=0.9, axis=channel_dim, training=training, name='bn')
         relu = tf.nn.relu(bn, name='relu')
     return relu
 
@@ -41,14 +41,14 @@ def deconv3d(input, output_chn, kernel_size = 4, stride = 2, data_format='channe
                                       use_bias=use_bias, name=name)
 
 
-def deconv3d_bn_relu(input, output_chn, kernel_size = 4, stride = 2, channel_dim =4, use_bias = False, training = True, name='deconv'):
+def deconv3d_bn_relu(input, output_chn, kernel_size = 4, stride = 2, channel_dim =-1, use_bias = False, training = True, name='deconv'):
     if channel_dim==1:
         data_format = 'channels_first'
     else:
         data_format ='channels_last'
     with tf.variable_scope(name):
         deconv = deconv3d(input, output_chn,kernel_size,stride,data_format,use_bias,name='deconv')
-        bn = tf.layers.batch_normalization(deconv, axis=channel_dim, training=training, name='bn')
+        bn = tf.layers.batch_normalization(deconv, momentum=0.9,axis=channel_dim, training=training, name='bn')
         relu = tf.nn.relu(bn, name='relu')
     return relu
 
@@ -79,6 +79,88 @@ def get_bilinear_initializer(in_chn, out_chn, filter_shape=4, upscale_factor=2):
                                    dtype=tf.float32)
 
     return init
+
+
+def conv_block(x, stage, branch, num_filter, concat_axis=4, dropout_rate=None, training=True):
+    '''Apply BatchNorm, Relu, bottleneck 1x1 Conv2D, 3x3 Conv2D, and option dropout
+        # Arguments
+            x: input tensor
+            stage: index for dense block
+            branch: layer index within each dense block
+            nb_filter: number of filters
+            dropout_rate: dropout rate
+    '''
+    conv_name_base = 'conv' + str(stage) + '_' + str(branch)
+    relu_name_base = 'relu' + str(stage) + '_' + str(branch)
+    if concat_axis == 1:
+        data_format = 'channels_first'
+    else:
+        data_format = 'channels_last'
+
+    # 3x3 Convolution
+    x = tf.layers.batch_normalization(x, axis=concat_axis,momentum=0.9,training=training, name=conv_name_base + '_x2_bn')
+    x = tf.nn.relu(x, name=relu_name_base + '_x2')
+    x = tf.layers.conv3d(x, num_filter, [3, 3, 3], padding='same', data_format=data_format,
+                         kernel_initializer=tf.random_normal_initializer(0.0, 0.01), use_bias=False,
+                         name=conv_name_base + '_x2')
+    if dropout_rate:
+        x = tf.layers.dropout(x, dropout_rate, training=training)
+
+    return x
+
+
+def dense_block(x, stage, num_layers, num_filter, growth_rate, concat_axis=-1, dropout_rate=None, training=True, grow_nb_filters=True):
+    ''' Build a dense_block where the output of each conv_block is fed to subsequent ones
+        # Arguments
+            x: input tensor
+            stage: index for dense block
+            nb_layers: the number of layers of conv_block to append to the model.
+            nb_filter: number of filters
+            growth_rate: growth rate
+            dropout_rate: dropout rate
+            weight_decay: weight decay factor
+            grow_nb_filters: flag to decide to allow number of filters to grow
+    '''
+    concat_feat = x
+    for i in range(num_layers):
+        branch = i+1
+        x = conv_block(concat_feat, stage, branch, growth_rate, concat_axis,dropout_rate,training)
+        concat_feat = tf.concat([concat_feat,x],axis=concat_axis,name='concat_'+str(stage)+'_'+str(branch))
+        if grow_nb_filters:
+            num_filter += growth_rate
+    return concat_feat, num_filter
+
+
+def transition_block(x, stage, num_filter, compression=1.0, concat_axis=-1, dropout_rate=None, training=True):
+    ''' Apply BatchNorm, 1x1 Convolution, averagePooling, optional compression, dropout
+        # Arguments
+            x: input tensor
+            stage: index for dense block
+            nb_filter: number of filters
+            compression: calculated as 1 - reduction. Reduces the number of feature maps in the transition block.
+            dropout_rate: dropout rate
+            weight_decay: weight decay factor
+    '''
+
+    conv_name_base = 'conv' + str(stage) + '_blk'
+    relu_name_base = 'relu' + str(stage) + '_blk'
+    # pool_name_base = 'pool' + str(stage)
+    if concat_axis == 1:
+        data_format = 'channels_first'
+    else:
+        data_format = 'channels_last'
+
+    x = tf.layers.batch_normalization(x, axis=concat_axis, momentum=0.9, training=training, name=conv_name_base + '_bn')
+    x = tf.nn.relu(x, name=relu_name_base)
+    x = tf.layers.conv3d(x, int(num_filter * compression), [1, 1, 1], padding='same', data_format=data_format,
+                         kernel_initializer=tf.random_normal_initializer(0.0, 0.01), use_bias=False,
+                         name=conv_name_base)
+    # if dropout_rate:
+    #     x_drop = tf.layers.dropout(x, dropout_rate, training=training)
+
+    return x,int(num_filter * compression)
+
+
 
 
 # dice loss function

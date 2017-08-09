@@ -7,6 +7,8 @@ import os
 from scipy.ndimage import measurements
 from glob import glob
 import pickle
+import tensorflow as tf
+
 
 ##############################
 # process .nii data
