@@ -48,8 +48,8 @@ class Model(object):
         self.input_gt = tf.placeholder(dtype=tf.int32, shape=[None, self.inputI_size, self.inputI_size,
                                                          self.inputI_size], name='target')
 
-        #main_logits, aux0_logits, aux1_logits = self.UNET()
-        main_logits, aux0_logits = self.DenseNet()
+        main_logits, aux0_logits, aux1_logits = self.UNET()
+        #main_logits, aux0_logits = self.DenseNet()
 
         if self.data_format=='channels_first':
             aux0_logits = tf.transpose(aux0_logits, perm=(0, 2, 3, 4, 1))
@@ -64,18 +64,18 @@ class Model(object):
             return
 
         # ========= calculate loss========
-        self.aux0_dice_loss = tf.losses.sparse_softmax_cross_entropy(self.input_gt, aux0_logits,weights=0.25)
-        #self.aux1_dice_loss = tf.losses.sparse_softmax_cross_entropy(self.input_gt, aux1_logits,weights=0.250)
-        self.main_dice_loss = tf.losses.sparse_softmax_cross_entropy(self.input_gt, main_logits, weights=0.75)
+        self.aux0_dice_loss = tf.losses.sparse_softmax_cross_entropy(self.input_gt, aux0_logits)
+        self.aux1_dice_loss = tf.losses.sparse_softmax_cross_entropy(self.input_gt, aux1_logits)
+        self.main_dice_loss = tf.losses.sparse_softmax_cross_entropy(self.input_gt, main_logits)
 
         # apply regularization
         tf.contrib.layers.apply_regularization(tf.contrib.layers.l2_regularizer(0.0001),tf.trainable_variables())
 
         # total loss
-        self.total_loss = tf.losses.get_total_loss(name='total_loss')
+        self.entroy_loss = 0.625*self.main_dice_loss + 0.25*self.aux1_dice_loss +0.125*self.aux0_dice_loss
+        self.total_loss = self.entroy_loss + tf.losses.get_regularization_loss()
 
         # make train op
-        #optimizer = tf.train.AdamOptimizer(learning_rate=self.lr)
         self.learning_rate = tf.train.polynomial_decay(self.lr,tf.train.get_or_create_global_step(),
                                                        decay_steps=self.iter_nums, power=0.9)
         optimizer = tf.train.MomentumOptimizer(self.learning_rate, 0.9)
@@ -92,8 +92,8 @@ class Model(object):
         tf.summary.scalar('losses/regu_loss', tf.losses.get_regularization_loss())
         tf.summary.scalar('losses/main_loss', self.main_dice_loss)
         tf.summary.scalar('losses/aux0_loss', self.aux0_dice_loss)
-        #tf.summary.scalar('losses/aux1_loss', self.aux1_dice_loss)
-        tf.summary.scalar('losses/total_loss', self.total_loss)
+        tf.summary.scalar('losses/aux1_loss', self.aux1_dice_loss)
+        tf.summary.scalar('losses/entroy_loss',self.entroy_loss)
         self.summary_op = tf.summary.merge_all()
         self.summary_writer = tf.summary.FileWriter(os.path.join(self.model_path, 'logs'), self.sess.graph)
 
@@ -177,11 +177,14 @@ class Model(object):
 
             # auxiliary prediction 0
             if self.up_feat:
-                aux0_deconv_a = deconv3d_bn_relu(input=deconv1c, output_chn=128, channel_dim=self.channel_dim,
-                                                 training=self.phase_flag, name='aux0_deconv_a')
-                aux0_deconv_b = deconv3d_bn_relu(input=aux0_deconv_a, output_chn=64, channel_dim=self.channel_dim,
-                                                 training=self.phase_flag, name='aux0_deconv_b')
-                aux0_logits = conv3d(input=aux0_deconv_b, output_chn=self.output_chn, kernel_size=1, stride=1,
+                aux0_deconv1 = deconv3d(input=deconv1c, output_chn=128, data_format=self.data_format, name='aux0_deconv1')
+                aux0_deconv1_relu = tf.nn.relu(aux0_deconv1, name='aux0_deconv1_relu')
+
+                aux0_deconv2 = deconv3d(input=aux0_deconv1_relu, output_chn=64, data_format=self.data_format,
+                                        name='aux0_deconv2')
+                aux0_deconv2_relu = tf.nn.relu(aux0_deconv2, name='aux0_deconv2_relu')
+
+                aux0_logits = conv3d(input=aux0_deconv2_relu, output_chn=self.output_chn, kernel_size=1, stride=1,
                                      data_format=self.data_format, use_bias=True, name='aux0_prob')
             else:
                 aux0_logits = conv3d(input=deconv1c, output_chn=self.output_chn, kernel_size=1, stride=1,
@@ -193,9 +196,11 @@ class Model(object):
 
             # auxiliary prediction 1
             if self.up_feat:
-                aux1_deconv_a = deconv3d_bn_relu(input=deconv2c, output_chn=64, channel_dim=self.channel_dim,
-                                                 training=self.phase_flag, name='aux1_deconv_a')
-                aux1_logits = conv3d(input=aux1_deconv_a, output_chn=self.output_chn, kernel_size=1, stride=1,
+                aux1_deconv1 = deconv3d(input=deconv2c, output_chn=64, data_format=self.data_format,
+                                        name='aux1_deconv1')
+                aux1_deconv1_relu = tf.nn.relu(aux1_deconv1, name='aux1_deconv1_relu')
+
+                aux1_logits = conv3d(input=aux1_deconv1_relu, output_chn=self.output_chn, kernel_size=1, stride=1,
                                      data_format=self.data_format, use_bias=True, name='aux1_prob')
             else:
                 aux1_logits = conv3d(input=deconv2c, output_chn=self.output_chn, kernel_size=1, stride=1,
@@ -270,27 +275,36 @@ class Model(object):
         print "Total {} volumes for training".format(len(train_imgs))
         print "Total {} volumes for validation".format(len(val_imgs))
 
-        for iter in tqdm(range(self.iter_nums),ncols=70):
+        for iter in tqdm(range(self.iter_nums),ncols=50):
             if iter < restore_step:
                 continue
             # train batch
+            start = time.time()
             batch_img, batch_label = get_batch_patches(train_imgs, train_labels, self.inputI_size, self.batch_size, chn=4, flip_flag=True, rot_flag=True)
             if self.data_format=='channels_first':
                 batch_img = np.transpose(batch_img,(0,4,1,2,3))
+            end = time.time()
+            print "time:{}".format(end-start)
+
             self.sess.run(self.train_op, feed_dict={self.input_I: batch_img, self.input_gt: batch_label})
 
             if iter%10==0:
-                loss,summary_str = self.sess.run([self.total_loss,self.summary_op],
+                loss,summary_str = self.sess.run([self.entroy_loss,self.summary_op],
                                                feed_dict={self.input_I: batch_img, self.input_gt: batch_label})
                 #run validation batch
                 val_img, val_label = get_batch_patches(val_imgs, val_labels, self.inputI_size, self.batch_size, chn=4,
                                                        flip_flag=False, rot_flag=False)
                 if self.data_format == 'channels_first':
                     val_img = np.transpose(val_img, (0, 4, 1, 2, 3))
-                val_loss = self.sess.run(self.total_loss,feed_dict={self.input_I: val_img, self.input_gt: val_label})
+                val_loss = self.sess.run(self.entroy_loss,feed_dict={self.input_I: val_img, self.input_gt: val_label})
+                lr = self.sess.run(self.learning_rate)
+                loss_log.write("lr: %s train_loss: %s valid_loss:%s\n" % (lr,loss, val_loss))
+                print("lr: %.8f train_loss: %.8f valid_loss: %.8f" % (lr,loss, val_loss))
 
-                loss_log.write("train_loss: %s\tvalid_loss:%s\n" % (loss, val_loss))
-                print("train_loss: %.8f, valid_loss: %.8f" % (loss, val_loss))
+                #add validation loss summary
+                val_summary = tf.Summary()
+                val_summary.value.add(simple_value=val_loss,tag='losses/val_entroy_loss')
+                self.summary_writer.add_summary(val_summary, iter)
                 self.summary_writer.add_summary(summary_str, iter)
 
             if iter%3000 ==2999 or iter==self.iter_nums-1:

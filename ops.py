@@ -175,23 +175,15 @@ def dice_loss_fun(self, pred, input_gt):
         dice = dice + 2*inse/(l+r)
     return -dice
 
-# class-weighted cross-entropy loss function
-def softmax_weighted_loss(self, logits, labels):
-    """
-    Loss = weighted * -target*log(softmax(logits))
-    :param logits: probability score
-    :param labels: ground_truth
-    :return: softmax-weifhted loss
-    """
-    gt = tf.one_hot(labels, 4)
-    pred = logits
-    softmaxpred = tf.nn.softmax(pred)
-    loss = 0
-    for i in range(4):
-        gti = gt[:,:,:,:,i]
-        predi = softmaxpred[:,:,:,:,i]
-        weighted = 1-(tf.reduce_sum(gti)/tf.reduce_sum(gt))
-        # print("class %d"%(i))
-        # print(weighted)
-        loss = loss+ -tf.reduce_mean(weighted * gti * tf.log(tf.clip_by_value(predi, 0.005, 1)))
-    return loss
+def softmax_weighted_loss(labels, logits, weights=1.0, num_classes= None,loss_collection=tf.GraphKeys.LOSSES,scope=None):
+    with tf.name_scope(scope):
+        if num_classes is None:
+            num_classes = logits.get_shape()[-1]
+        labels = tf.one_hot(labels, depth=num_classes)
+        epsilon = tf.constant(value=1e-10)
+        softmax = tf.nn.softmax(logits+epsilon)+epsilon
+        weighted = 1.0-tf.to_float(tf.reduce_sum(labels,axis=[0,1,2,3]))/tf.to_float(tf.reduce_sum(labels))
+        cross_entropy = -tf.reduce_sum(labels*tf.log(softmax)*weighted,axis=-1)
+        cross_entropy_mean = weights*tf.reduce_mean(cross_entropy, name='xentropy')
+        tf.add_to_collection(loss_collection, cross_entropy_mean)
+    return cross_entropy_mean

@@ -8,7 +8,7 @@ import pickle
 
 def eval_model():
     testdata_dir = '/home/lqyu/server/gpu8/BRATS2017/data/Brats17TrainingData'
-    labeling_dir = '/home/lqyu/server/gpu8/BRATS2017/result/Dense_feat_ori'
+    labeling_dir = '/home/lqyu/server/gpu8/BRATS2017/result/UNet_feat_simple'
 
     pair_list = glob('{}/*/*/*_seg.nii.gz'.format(testdata_dir))
     pair_list.sort()
