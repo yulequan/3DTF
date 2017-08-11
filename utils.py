@@ -130,7 +130,7 @@ def load_data_pairs(traindata_dir, patch_dim=64, reset_h5=False, phase='train'):
     return img_clec, label_clec
 
 
-def get_batch_patches(img_clec, label_clec, patch_dim, batch_size, chn, flip_flag=True, rot_flag=True):
+def get_batch_patches(img_clec, label_clec, patch_dim, batch_size, chn, data_format = 'channels_last',flip_flag=True, rot_flag=True):
 
     """generate a batch of paired patches for training"""
     batch_img = np.zeros([batch_size, patch_dim, patch_dim, patch_dim, chn]).astype('float32')
@@ -175,6 +175,8 @@ def get_batch_patches(img_clec, label_clec, patch_dim, batch_size, chn, flip_fla
         batch_img[k, :, :, :,:] = img_temp
         batch_label[k, :, :, :] = label_temp
 
+    if data_format == 'channels_first':
+        batch_img = np.transpose(batch_img, (0, 4, 1, 2, 3))
     return batch_img, batch_label
 
 # decompose volume into list of cubes
