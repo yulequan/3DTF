@@ -48,38 +48,55 @@ class Model(object):
         self.input_gt = tf.placeholder(dtype=tf.int32, shape=[None, self.inputI_size, self.inputI_size,
                                                          self.inputI_size], name='target')
 
-        main_logits, aux0_logits, aux1_logits = self.UNET_modality()
+
+        logits = self.UNET_modality_pool5(chn_num=64,fusion_method='concat1')
+        #logits = self.UNET_modality32('concat1')
+        #logits = self.UNET()
         #main_logits, aux0_logits = self.DenseNet()
 
-        if self.data_format=='channels_first':
-            aux0_logits = tf.transpose(aux0_logits, perm=(0, 2, 3, 4, 1))
-            aux1_logits = tf.transpose(aux1_logits, perm=(0, 2, 3, 4, 1))
-            main_logits = tf.transpose(main_logits, perm=(0, 2, 3, 4, 1))
-
         # predicted labels
-        self.pred_prob = tf.nn.softmax(main_logits, name='pred_soft')
+        self.pred_prob = tf.nn.softmax(logits[0], name='pred_soft')
         self.pred_label = tf.argmax(self.pred_prob, axis=4, name='argmax')
 
         if not self.phase:
             return
 
         # ========= calculate loss========
-        self.aux0_dice_loss = tf.losses.sparse_softmax_cross_entropy(self.input_gt, aux0_logits)
-        self.aux1_dice_loss = tf.losses.sparse_softmax_cross_entropy(self.input_gt, aux1_logits)
-        self.main_dice_loss = tf.losses.sparse_softmax_cross_entropy(self.input_gt, main_logits)
+        self.losses = []
+        for logit in logits:
+            self.losses.append(tf.losses.sparse_softmax_cross_entropy(self.input_gt,logit))
+            #self.losses.append(weighted_softmax_cross_entropy(self.input_gt, logit,weighted='median_freq'))
+            #self.losses.append(focal_loss(self.input_gt, logit))
+            #self.losses.append(dice_loss(self.input_gt,logit))
+
+
+        # self.aux0_loss = focal_loss(self.input_gt, aux0_logits)
+        # self.aux1_loss = focal_loss(self.input_gt, aux1_logits)
+        # self.main_loss = focal_loss(self.input_gt, main_logits)
 
         # apply regularization
         tf.contrib.layers.apply_regularization(tf.contrib.layers.l2_regularizer(0.0001),tf.trainable_variables())
 
         # total loss
-        self.entroy_loss = 0.625*self.main_dice_loss + 0.25*self.aux1_dice_loss +0.125*self.aux0_dice_loss
+        # fused_loss, main_loss, aux2_loss, aux1_loss, aux0_loss
+        # weights = [0.3, 0.3, 0.2, 0.1, 0.1]
+
+        # main_loss, aux2_loss, aux1_loss, aux0_loss
+        weights = [0.6, 0.2, 0.1, 0.1]
+
+        # main_loss, aux1_loss, aux0_loss
+        #weights = [0.625, 0.25, 0.125]
+
+        self.entroy_loss = 0
+        for i in range(len(self.losses)):
+            self.entroy_loss += weights[i]*self.losses[i]
         self.total_loss = self.entroy_loss + tf.losses.get_regularization_loss()
 
         # make train op
         self.learning_rate = tf.train.polynomial_decay(self.lr,tf.train.get_or_create_global_step(),
                                                        decay_steps=self.iter_nums, power=0.9)
         optimizer = tf.train.MomentumOptimizer(self.learning_rate, 0.9)
-        self.train_op = tf.contrib.training.create_train_op(self.total_loss, optimizer)
+        self.train_op = tf.contrib.training.create_train_op(self.total_loss, optimizer,colocate_gradients_with_ops=True)
         tf.summary.scalar('lr/learning_rate', self.learning_rate)
 
         # add summary images
@@ -89,14 +106,443 @@ class Model(object):
         tf.summary.image('img/input_flair',flair,max_outputs=3)
         tf.summary.image('img/pred', pred, max_outputs=3)
         tf.summary.image('img/gt', gt, max_outputs=3)
-        tf.summary.scalar('losses/regu_loss', tf.losses.get_regularization_loss())
-        tf.summary.scalar('losses/main_loss', self.main_dice_loss)
-        tf.summary.scalar('losses/aux0_loss', self.aux0_dice_loss)
-        tf.summary.scalar('losses/aux1_loss', self.aux1_dice_loss)
+
+        for i,loss in enumerate(self.losses):
+            tf.summary.scalar('losses/entroy_loss_{}'.format(i), loss)
         tf.summary.scalar('losses/entroy_loss',self.entroy_loss)
+        tf.summary.scalar('losses/regu_loss', tf.losses.get_regularization_loss())
+        tf.summary.scalar('losses/total_loss', self.total_loss)
         self.summary_op = tf.summary.merge_all()
         self.summary_writer = tf.summary.FileWriter(os.path.join(self.model_path, 'logs'), self.sess.graph)
 
+    def multimodal_fusion(self,feats, output_chn, method='concat1',name=None):
+        with tf.variable_scope(name):
+            if method == 'concat1':
+                atten_feats = tf.concat(feats, axis=self.chn_dim)
+
+                return conv3d_bn_relu(atten_feats, output_chn, 1, 1, self.chn_dim, training=self.phase, name='conv')
+            elif method == 'concat2':
+                atten_feats = tf.concat(feats, axis=self.chn_dim)
+                pool = tf.layers.average_pooling3d(atten_feats,atten_feats.shape.as_list()[1],
+                                                   atten_feats.shape.as_list()[1],data_format=self.data_format,name='global')
+                fc = tf.nn.sigmoid(tf.layers.dense(pool,output_chn,name='fc'))
+                return conv3d_bn_relu(atten_feats*fc, output_chn, 1, 1, self.chn_dim, training=self.phase, name='conv')
+
+
+            elif method=='attention1':
+                inputs = tf.concat(feats, axis=self.chn_dim)
+                attention1 = conv3d(inputs,feats[0].shape[-1],1,1,self.data_format,name='attention1')
+                attention2 = conv3d(attention1,4,3,1,self.data_format,name='attention2')
+                soft = tf.nn.softmax(attention2,name='soft_attention')
+                soft_unstack = tf.unstack(soft,axis=-1)
+                atten_feats = tf.concat([tf.expand_dims(w,-1)*feat for w,feat in zip(soft_unstack,feats)], axis=self.chn_dim)
+
+                return conv3d_bn_relu(atten_feats, output_chn, 1, 1, self.chn_dim, training=self.phase, name='conv')
+            elif method == 'attention2':
+                return 0
+
+    def UNET_modality32(self, fusion_method='concat1'):
+        # downsample path
+        conv1a = [];pool1 = [];conv2a = [];pool2 = [];conv3a = [];conv3b = [];pool3 = [];conv4a = [];conv4b = []
+        for m in range(4):
+            with tf.variable_scope('M{}'.format(m)):
+                conv1a.append(
+                    conv3d_bn_relu(self.input_I[:, :, :, :, m:m + 1], 32, 3, 1, self.chn_dim, training=self.phase,
+                                   name='conv1a'))
+                pool1.append(tf.layers.max_pooling3d(conv1a[m], 2, 2, data_format=self.data_format, name='pool1'))
+
+                with tf.device("/gpu:1"):
+                    conv2a.append(conv3d_bn_relu(pool1[m], 64, 3, 1, self.chn_dim, training=self.phase, name='conv2a'))
+                    pool2.append(tf.layers.max_pooling3d(conv2a[m], 2, 2, data_format=self.data_format, name='pool2'))
+
+                    conv3a.append(conv3d_bn_relu(pool2[m], 128, 3, 1, self.chn_dim, training=self.phase, name='conv3a'))
+                    conv3b.append(
+                        conv3d_bn_relu(conv3a[m], 128, 3, 1, self.chn_dim, training=self.phase, name='conv3b'))
+                    pool3.append(tf.layers.max_pooling3d(conv3b[m], 2, 2, data_format=self.data_format, name='pool3'))
+
+                    conv4a.append(conv3d_bn_relu(pool3[m], 256, 3, 1, self.chn_dim, training=self.phase, name='conv4a'))
+                    conv4b.append(
+                        conv3d_bn_relu(conv4a[m], 256, 3, 1, self.chn_dim, training=self.phase, name='conv4b'))
+
+        # upsample path
+        with tf.device("/gpu:1"):
+            conv4 = self.multimodal_fusion(conv4b, 32, fusion_method, name='conv4_fusion')
+            conv3 = self.multimodal_fusion(conv3b, 32, fusion_method, name='conv3_fusion')
+            conv2 = self.multimodal_fusion(conv2a, 32, fusion_method, name='conv2_fusion')
+        conv1 = self.multimodal_fusion(conv1a, 32, fusion_method, name='conv1_fusion')
+        with tf.device("/gpu:1"):
+            deconv1a = deconv3d_bn_relu(input=conv4, output_chn=32, channel_dim=self.chn_dim,
+                                        training=self.phase, name='deconv1a')
+            concat1 = tf.concat([deconv1a, conv3], axis=self.chn_dim, name='concat1')
+            deconv1b = conv3d_bn_relu(input=concat1, output_chn=32, kernel_size=1, stride=1, channel_dim=self.chn_dim,
+                                      use_bias=False, training=self.phase, name='deconv1b')
+            deconv1c = conv3d_bn_relu(input=deconv1b, output_chn=32, kernel_size=3, stride=1, channel_dim=self.chn_dim,
+                                      use_bias=False, training=self.phase, name='deconv1c')
+
+            deconv2a = deconv3d_bn_relu(input=deconv1c, output_chn=32, channel_dim=self.chn_dim,
+                                        training=self.phase, name='deconv2a')
+            concat2 = tf.concat([deconv2a, conv2], axis=self.chn_dim, name='concat2')
+            deconv2b = conv3d_bn_relu(input=concat2, output_chn=32, kernel_size=1, stride=1, channel_dim=self.chn_dim,
+                                      use_bias=False, training=self.phase, name='deconv2b')
+            deconv2c = conv3d_bn_relu(input=deconv2b, output_chn=32, kernel_size=3, stride=1, channel_dim=self.chn_dim,
+                                      use_bias=False, training=self.phase, name='deconv2c')
+
+        deconv3a = deconv3d_bn_relu(input=deconv2c, output_chn=32, channel_dim=self.chn_dim,
+                                    training=self.phase, name='deconv3a')
+        concat3 = tf.concat([deconv3a, conv1], axis=self.chn_dim, name='concat3')
+        deconv3b = conv3d_bn_relu(input=concat3, output_chn=32, kernel_size=1, stride=1, channel_dim=self.chn_dim,
+                                  use_bias=False, training=self.phase, name='deconv3b')
+        deconv3c = conv3d_bn_relu(input=deconv3b, output_chn=32, kernel_size=3, stride=1, channel_dim=self.chn_dim,
+                                  use_bias=False, training=self.phase, name='deconv3c')
+
+        with tf.device("/gpu:1"):
+            # auxiliary prediction 0
+            if self.up_feat:
+                aux0_deconv1 = deconv3d(input=deconv1c, output_chn=32, data_format=self.data_format,
+                                        name='aux0_deconv1')
+                aux0_deconv1_relu = tf.nn.relu(aux0_deconv1, name='aux0_deconv1_relu')
+
+                aux0_deconv2 = deconv3d(input=aux0_deconv1_relu, output_chn=32, data_format=self.data_format,
+                                        name='aux0_deconv2')
+                aux0_deconv2_relu = tf.nn.relu(aux0_deconv2, name='aux0_deconv2_relu')
+
+                aux0_logits = conv3d(input=aux0_deconv2_relu, output_chn=self.output_chn, kernel_size=1, stride=1,
+                                     data_format=self.data_format, use_bias=True, name='aux0_prob')
+            else:
+                aux0_logits = conv3d(input=deconv1c, output_chn=self.output_chn, kernel_size=1, stride=1,
+                                     data_format=self.data_format, use_bias=True, name='aux0_conv')
+                aux0_logits = deconv3d(input=aux0_logits, output_chn=self.output_chn, data_format=self.data_format,
+                                       use_bias=False, use_bilinear=True, name='aux0_prob_')
+                aux0_logits = deconv3d(input=aux0_logits, output_chn=self.output_chn,
+                                       data_format=self.data_format, use_bias=False, use_bilinear=True,
+                                       name='aux0_prob')
+
+            # auxiliary prediction 1
+            if self.up_feat:
+                aux1_deconv1 = deconv3d(input=deconv2c, output_chn=32, data_format=self.data_format,
+                                        name='aux1_deconv1')
+                aux1_deconv1_relu = tf.nn.relu(aux1_deconv1, name='aux1_deconv1_relu')
+
+                aux1_logits = conv3d(input=aux1_deconv1_relu, output_chn=self.output_chn, kernel_size=1, stride=1,
+                                     data_format=self.data_format, use_bias=True, name='aux1_prob')
+            else:
+                aux1_logits = conv3d(input=deconv2c, output_chn=self.output_chn, kernel_size=1, stride=1,
+                                     data_format=self.data_format, use_bias=True, name='aux1_conv')
+                aux1_logits = deconv3d(input=aux1_logits, output_chn=self.output_chn, data_format=self.data_format,
+                                       use_bias=False, use_bilinear=True, name='aux1_prob')
+        # predicted probability
+        main_logits = conv3d(input=deconv3c, output_chn=self.output_chn, kernel_size=1, stride=1,
+                             data_format=self.data_format, use_bias=True, name='pred_prob')
+
+        return [main_logits, aux1_logits, aux0_logits]
+
+    def UNET_modality32_pool5(self,fusion_method='concat1'):
+        #downsample path
+        conv1a = [];pool1 = [];conv2a=[];pool2=[];conv3a=[];conv3b=[];pool3=[];conv4a=[];conv4b=[]
+        pool4 = [];conv5a = []; conv5b=[]
+        for m in range(4):
+            with tf.variable_scope('M{}'.format(m)):
+                conv1a.append(conv3d_bn_relu(self.input_I[:,:,:,:,m:m+1], 32, 3, 1, self.chn_dim, training=self.phase, name='conv1a'))
+                pool1.append(tf.layers.max_pooling3d(conv1a[m],2,2,data_format=self.data_format,name='pool1'))
+
+                with tf.device("/gpu:1"):
+                    conv2a.append(conv3d_bn_relu(pool1[m], 64, 3, 1, self.chn_dim, training=self.phase, name='conv2a'))
+                    pool2.append(tf.layers.max_pooling3d(conv2a[m],2,2,data_format=self.data_format,name='pool2'))
+
+                    conv3a.append(conv3d_bn_relu(pool2[m], 128, 3, 1, self.chn_dim, training=self.phase, name='conv3a'))
+                    conv3b.append(conv3d_bn_relu(conv3a[m], 128, 3, 1, self.chn_dim, training=self.phase, name='conv3b'))
+                    pool3.append(tf.layers.max_pooling3d(conv3b[m], 2, 2, data_format=self.data_format, name='pool3'))
+
+                    conv4a.append(conv3d_bn_relu(pool3[m], 256, 3, 1, self.chn_dim, training=self.phase, name='conv4a'))
+                    conv4b.append(conv3d_bn_relu(conv4a[m], 256, 3, 1, self.chn_dim, training=self.phase, name='conv4b'))
+                    pool4.append(tf.layers.max_pooling3d(conv4b[m], 2, 2, data_format=self.data_format, name='pool4'))
+
+                    conv5a.append(conv3d_bn_relu(pool4[m], 512, 3, 1, self.chn_dim, training=self.phase, name='conv5a'))
+                    conv5b.append(conv3d_bn_relu(conv5a[m], 512, 3, 1, self.chn_dim, training=self.phase, name='conv5b'))
+
+        #upsample path
+        with tf.device("/gpu:1"):
+            conv5 = self.multimodal_fusion(conv5b, 32, fusion_method, name='conv5_fusion')
+            conv4 = self.multimodal_fusion(conv4b,32, fusion_method,name='conv4_fusion')
+            conv3 = self.multimodal_fusion(conv3b,32, fusion_method,name='conv3_fusion')
+            conv2 = self.multimodal_fusion(conv2a,32, fusion_method,name='conv2_fusion')
+        conv1 = self.multimodal_fusion(conv1a,32,  fusion_method,name='conv1_fusion')
+        with tf.device("/gpu:1"):
+            deconv1a = deconv3d_bn_relu(input=conv5, output_chn=32, channel_dim=self.chn_dim,
+                                        training=self.phase, name='deconv1a')
+            concat1 = tf.concat([deconv1a, conv4], axis=self.chn_dim, name='concat1')
+            deconv1b = conv3d_bn_relu(input=concat1, output_chn=32, kernel_size=1, stride=1, channel_dim=self.chn_dim,
+                                      use_bias=False, training=self.phase, name='deconv1b')
+            deconv1c = conv3d_bn_relu(input=deconv1b, output_chn=32, kernel_size=3, stride=1, channel_dim=self.chn_dim,
+                                      use_bias=False, training=self.phase,  name='deconv1c')
+
+            deconv2a = deconv3d_bn_relu(input=deconv1c, output_chn=32, channel_dim=self.chn_dim,
+                                        training=self.phase,  name='deconv2a')
+            concat2 = tf.concat([deconv2a, conv3], axis=self.chn_dim, name='concat2')
+            deconv2b = conv3d_bn_relu(input=concat2, output_chn=32, kernel_size=1, stride=1, channel_dim=self.chn_dim,
+                                      use_bias=False, training=self.phase, name='deconv2b')
+            deconv2c = conv3d_bn_relu(input=deconv2b, output_chn=32, kernel_size=3, stride=1, channel_dim=self.chn_dim,
+                                      use_bias=False, training=self.phase, name='deconv2c')
+
+            deconv3a = deconv3d_bn_relu(input=deconv2c, output_chn=32, channel_dim=self.chn_dim,
+                                        training=self.phase, name='deconv3a')
+            concat3 = tf.concat([deconv3a, conv2], axis=self.chn_dim, name='concat3')
+            deconv3b = conv3d_bn_relu(input=concat3, output_chn=32, kernel_size=1, stride=1, channel_dim=self.chn_dim,
+                                      use_bias=False, training=self.phase,name='deconv3b')
+            deconv3c = conv3d_bn_relu(input=deconv3b, output_chn=32, kernel_size=3, stride=1, channel_dim=self.chn_dim,
+                                      use_bias=False, training=self.phase, name='deconv3c')
+
+        deconv4a = deconv3d_bn_relu(input=deconv3c, output_chn=32, channel_dim=self.chn_dim,
+                                    training=self.phase, name='deconv4a')
+        concat4 = tf.concat([deconv4a, conv1], axis=self.chn_dim, name='concat4')
+        deconv4b = conv3d_bn_relu(input=concat4, output_chn=32, kernel_size=1, stride=1, channel_dim=self.chn_dim,
+                                  use_bias=False, training=self.phase, name='deconv4b')
+        deconv4c = conv3d_bn_relu(input=deconv4b, output_chn=32, kernel_size=3, stride=1, channel_dim=self.chn_dim,
+                                  use_bias=False, training=self.phase, name='deconv4c')
+
+        with tf.device("/gpu:1"):
+            # auxiliary prediction 0
+            if self.up_feat:
+                aux0_deconv1 = deconv3d(input=deconv1c, output_chn=32, data_format=self.data_format, name='aux0_deconv1')
+                aux0_deconv1_relu = tf.nn.relu(aux0_deconv1, name='aux0_deconv1_relu')
+
+                aux0_deconv2 = deconv3d(input=aux0_deconv1_relu, output_chn=32, data_format=self.data_format,name='aux0_deconv2')
+                aux0_deconv2_relu = tf.nn.relu(aux0_deconv2, name='aux0_deconv2_relu')
+
+                aux0_deconv3 = deconv3d(input=aux0_deconv2_relu, output_chn=32, data_format=self.data_format,
+                                        name='aux0_deconv3')
+                aux0_deconv3_relu = tf.nn.relu(aux0_deconv3, name='aux0_deconv3_relu')
+
+                aux0_logits = conv3d(input=aux0_deconv3_relu, output_chn=self.output_chn, kernel_size=1, stride=1,
+                                     data_format=self.data_format, use_bias=True, name='aux0_prob')
+            else:
+                aux0_logits = conv3d(input=deconv1c, output_chn=self.output_chn, kernel_size=1, stride=1,
+                                     data_format=self.data_format, use_bias=True, name='aux0_conv')
+                aux0_logits = deconv3d(input=aux0_logits, output_chn=self.output_chn, data_format=self.data_format,
+                                       use_bias=False, use_bilinear=True, name='aux0_prob_')
+                aux0_logits = deconv3d(input=aux0_logits, output_chn=self.output_chn,
+                                       data_format=self.data_format, use_bias=False, use_bilinear=True, name='aux0_prob')
+
+            # auxiliary prediction 1
+            if self.up_feat:
+                aux1_deconv1 = deconv3d(input=deconv2c, output_chn=32, data_format=self.data_format,
+                                        name='aux1_deconv1')
+                aux1_deconv1_relu = tf.nn.relu(aux1_deconv1, name='aux1_deconv1_relu')
+
+                aux1_deconv2 = deconv3d(input=aux1_deconv1_relu, output_chn=32, data_format=self.data_format,
+                                        name='aux1_deconv2')
+                aux1_deconv2_relu = tf.nn.relu(aux1_deconv2, name='aux1_deconv2_relu')
+
+                aux1_logits = conv3d(input=aux1_deconv2_relu, output_chn=self.output_chn, kernel_size=1, stride=1,
+                                     data_format=self.data_format, use_bias=True, name='aux1_prob')
+            else:
+                aux1_logits = conv3d(input=deconv2c, output_chn=self.output_chn, kernel_size=1, stride=1,
+                                     data_format=self.data_format, use_bias=True, name='aux1_conv')
+                aux1_logits = deconv3d(input=aux1_logits, output_chn=self.output_chn, data_format=self.data_format,
+                                       use_bias=False, use_bilinear=True, name='aux1_prob')
+            # auxiliary prediction 2
+            if self.up_feat:
+                aux2_deconv1 = deconv3d(input=deconv3c, output_chn=32, data_format=self.data_format,
+                                        name='aux2_deconv1')
+                aux2_deconv1_relu = tf.nn.relu(aux2_deconv1, name='aux2_deconv2_relu')
+
+                aux2_logits = conv3d(input=aux2_deconv1_relu, output_chn=self.output_chn, kernel_size=1, stride=1,
+                                    data_format=self.data_format, use_bias=True, name='aux2_prob')
+        # predicted probability
+        main_logits = conv3d(input=deconv4c, output_chn=self.output_chn, kernel_size=1, stride=1,
+                             data_format=self.data_format, use_bias=True, name='pred_prob')
+
+        # fusion probability
+        fused = tf.concat([deconv4c,aux2_deconv1_relu,aux1_deconv2_relu],axis=self.chn_dim)
+        # fused_logits = conv3d(input=fused,output_chn=self.output_chn,kernel_size=1,stride=1,
+        #                        data_format=self.data_format,use_bias=True,name='fused_prob')
+        return [main_logits, aux2_logits, aux1_logits, aux0_logits]
+
+    def UNET_modality_pool5(self,chn_num = 64, fusion_method='concat1'):
+        #downsample path
+        conv1a = [];pool1 = [];conv2a=[];pool2=[];conv3a=[];conv3b=[];pool3=[];conv4a=[];conv4b=[]
+        pool4 = [];conv5a = []; conv5b=[]
+        for m in range(4):
+            with tf.variable_scope('M{}'.format(m)):
+                with tf.device("/gpu:0"):
+                    conv1a.append(conv3d_bn_relu(self.input_I[:,:,:,:,m:m+1], chn_num, 3, 1, self.chn_dim, training=self.phase, name='conv1a'))
+                    pool1.append(tf.layers.max_pooling3d(conv1a[m],2,2,data_format=self.data_format,name='pool1'))
+
+                with tf.device("/gpu:1"):
+                    conv2a.append(conv3d_bn_relu(pool1[m], chn_num*2, 3, 1, self.chn_dim, training=self.phase, name='conv2a'))
+                    pool2.append(tf.layers.max_pooling3d(conv2a[m],2,2,data_format=self.data_format,name='pool2'))
+
+                    conv3a.append(conv3d_bn_relu(pool2[m], chn_num*4, 3, 1, self.chn_dim, training=self.phase, name='conv3a'))
+                    conv3b.append(conv3d_bn_relu(conv3a[m],chn_num*4, 3, 1, self.chn_dim, training=self.phase, name='conv3b'))
+                    pool3.append(tf.layers.max_pooling3d(conv3b[m], 2, 2, data_format=self.data_format, name='pool3'))
+
+                    conv4a.append(conv3d_bn_relu(pool3[m], chn_num*8, 3, 1, self.chn_dim, training=self.phase, name='conv4a'))
+                    conv4b.append(conv3d_bn_relu(conv4a[m],chn_num*8, 3, 1, self.chn_dim, training=self.phase, name='conv4b'))
+                    pool4.append(tf.layers.max_pooling3d(conv4b[m], 2, 2, data_format=self.data_format, name='pool4'))
+
+                    conv5a.append(conv3d_bn_relu(pool4[m], chn_num*8, 3, 1, self.chn_dim, training=self.phase, name='conv5a'))
+                    conv5b.append(conv3d_bn_relu(conv5a[m],chn_num*8, 3, 1, self.chn_dim, training=self.phase, name='conv5b'))
+
+        #upsample path
+        with tf.device("/gpu:1"):
+            conv5 = self.multimodal_fusion(conv5b, chn_num, fusion_method, name='conv5_fusion')
+            conv4 = self.multimodal_fusion(conv4b, chn_num, fusion_method,name='conv4_fusion')
+            conv3 = self.multimodal_fusion(conv3b, chn_num, fusion_method,name='conv3_fusion')
+            conv2 = self.multimodal_fusion(conv2a, chn_num, fusion_method,name='conv2_fusion')
+        with tf.device("/gpu:0"):
+            conv1 = self.multimodal_fusion(conv1a,     chn_num, fusion_method,name='conv1_fusion')
+
+        with tf.device("/gpu:1"):
+            deconv1a = deconv3d_bn_relu(input=conv5, output_chn=chn_num, channel_dim=self.chn_dim,
+                                        training=self.phase, name='deconv1a')
+            concat1 = tf.concat([deconv1a, conv4], axis=self.chn_dim, name='concat1')
+            deconv1b = conv3d_bn_relu(input=concat1, output_chn=chn_num, kernel_size=1, stride=1, channel_dim=self.chn_dim,
+                                      use_bias=False, training=self.phase, name='deconv1b')
+            deconv1c = conv3d_bn_relu(input=deconv1b, output_chn=chn_num, kernel_size=3, stride=1, channel_dim=self.chn_dim,
+                                      use_bias=False, training=self.phase,  name='deconv1c')
+
+            deconv2a = deconv3d_bn_relu(input=deconv1c, output_chn=chn_num, channel_dim=self.chn_dim,
+                                        training=self.phase,  name='deconv2a')
+            concat2 = tf.concat([deconv2a, conv3], axis=self.chn_dim, name='concat2')
+            deconv2b = conv3d_bn_relu(input=concat2, output_chn=chn_num, kernel_size=1, stride=1, channel_dim=self.chn_dim,
+                                      use_bias=False, training=self.phase, name='deconv2b')
+            deconv2c = conv3d_bn_relu(input=deconv2b, output_chn=chn_num, kernel_size=3, stride=1, channel_dim=self.chn_dim,
+                                      use_bias=False, training=self.phase, name='deconv2c')
+
+            deconv3a = deconv3d_bn_relu(input=deconv2c, output_chn=chn_num, channel_dim=self.chn_dim,
+                                        training=self.phase, name='deconv3a')
+            concat3 = tf.concat([deconv3a, conv2], axis=self.chn_dim, name='concat3')
+            deconv3b = conv3d_bn_relu(input=concat3, output_chn=chn_num, kernel_size=1, stride=1, channel_dim=self.chn_dim,
+                                      use_bias=False, training=self.phase,name='deconv3b')
+            deconv3c = conv3d_bn_relu(input=deconv3b, output_chn=chn_num, kernel_size=3, stride=1, channel_dim=self.chn_dim,
+                                      use_bias=False, training=self.phase, name='deconv3c')
+        with tf.device("/gpu:1"): ### to gpu1 when chn=64
+            deconv4a = deconv3d_bn_relu(input=deconv3c, output_chn=chn_num, channel_dim=self.chn_dim,
+                                        training=self.phase, name='deconv4a')
+            concat4 = tf.concat([deconv4a, conv1], axis=self.chn_dim, name='concat4')
+            deconv4b = conv3d_bn_relu(input=concat4, output_chn=chn_num, kernel_size=1, stride=1, channel_dim=self.chn_dim,
+                                      use_bias=False, training=self.phase, name='deconv4b')
+            deconv4c = conv3d_bn_relu(input=deconv4b, output_chn=chn_num, kernel_size=3, stride=1, channel_dim=self.chn_dim,
+                                      use_bias=False, training=self.phase, name='deconv4c')
+
+        with tf.device("/gpu:1"):
+            # auxiliary prediction 0
+            aux0_deconv1 = deconv3d(input=deconv1c, output_chn=chn_num, data_format=self.data_format, name='aux0_deconv1')
+            aux0_deconv1_relu = tf.nn.relu(aux0_deconv1, name='aux0_deconv1_relu')
+            aux0_deconv2 = deconv3d(input=aux0_deconv1_relu, output_chn=chn_num, data_format=self.data_format,name='aux0_deconv2')
+            aux0_deconv2_relu = tf.nn.relu(aux0_deconv2, name='aux0_deconv2_relu')
+            aux0_deconv3 = deconv3d(input=aux0_deconv2_relu, output_chn=chn_num, data_format=self.data_format,name='aux0_deconv3')
+            aux0_deconv3_relu = tf.nn.relu(aux0_deconv3, name='aux0_deconv3_relu')
+            aux0_logits = conv3d(input=aux0_deconv3_relu, output_chn=self.output_chn, kernel_size=1, stride=1,
+                                 data_format=self.data_format, use_bias=True, name='aux0_prob')
+
+
+            # auxiliary prediction 1
+            aux1_deconv1 = deconv3d(input=deconv2c, output_chn=chn_num, data_format=self.data_format,name='aux1_deconv1')
+            aux1_deconv1_relu = tf.nn.relu(aux1_deconv1, name='aux1_deconv1_relu')
+            aux1_deconv2 = deconv3d(input=aux1_deconv1_relu, output_chn=chn_num, data_format=self.data_format,name='aux1_deconv2')
+            aux1_deconv2_relu = tf.nn.relu(aux1_deconv2, name='aux1_deconv2_relu')
+            aux1_logits = conv3d(input=aux1_deconv2_relu, output_chn=self.output_chn, kernel_size=1, stride=1,
+                                 data_format=self.data_format, use_bias=True, name='aux1_prob')
+
+            # auxiliary prediction 2
+            aux2_deconv1 = deconv3d(input=deconv3c, output_chn=chn_num, data_format=self.data_format,name='aux2_deconv1')
+            aux2_deconv1_relu = tf.nn.relu(aux2_deconv1, name='aux2_deconv2_relu')
+            aux2_logits = conv3d(input=aux2_deconv1_relu, output_chn=self.output_chn, kernel_size=1, stride=1,
+                                data_format=self.data_format, use_bias=True, name='aux2_prob')
+        with tf.device("/gpu:1"): ### to gpu1 when chn=64
+            # predicted probability
+            main_logits = conv3d(input=deconv4c, output_chn=self.output_chn, kernel_size=1, stride=1,
+                                 data_format=self.data_format, use_bias=True, name='pred_prob')
+
+        return [main_logits, aux2_logits, aux1_logits, aux0_logits]
+
+    def UNET_modality(self,fusion_method='concat'):
+        #downsample path
+        conv1a = [];pool1 = [];conv2a=[];pool2=[];conv3a=[];conv3b=[];pool3=[];conv4a=[];conv4b=[]
+        for m in range(4):
+            with tf.variable_scope('M{}'.format(m)):
+                conv1a.append(conv3d_bn_relu(self.input_I[:,:,:,:,m:m+1], 64, 3, 1, self.chn_dim, training=self.phase, name='conv1a'))
+                pool1.append(tf.layers.max_pooling3d(conv1a[m],2,2,data_format=self.data_format,name='pool1'))
+
+                with tf.device("/gpu:1"):
+                    conv2a.append(conv3d_bn_relu(pool1[m], 128, 3, 1, self.chn_dim, training=self.phase, name='conv2a'))
+                    pool2.append(tf.layers.max_pooling3d(conv2a[m],2,2,data_format=self.data_format,name='pool2'))
+
+                    conv3a.append(conv3d_bn_relu(pool2[m], 256, 3, 1, self.chn_dim, training=self.phase, name='conv3a'))
+                    conv3b.append(conv3d_bn_relu(conv3a[m], 256, 3, 1, self.chn_dim, training=self.phase, name='conv3b'))
+                    pool3.append(tf.layers.max_pooling3d(conv3b[m], 2, 2, data_format=self.data_format, name='pool3'))
+
+                    conv4a.append(conv3d_bn_relu(pool3[m], 512, 3, 1, self.chn_dim, training=self.phase, name='conv4a'))
+                    conv4b.append(conv3d_bn_relu(conv4a[m], 512, 3, 1, self.chn_dim, training=self.phase, name='conv4b'))
+
+        #upsample path
+        with tf.device("/gpu:1"):
+            conv4,self.atten4 = self.multimodal_fusion(conv4b,512, fusion_method,name='conv4_fusion')
+            conv3,self.atten3 = self.multimodal_fusion(conv3b,256, fusion_method,name='conv3_fusion')
+            conv2,self.atten2 = self.multimodal_fusion(conv2a,128, fusion_method,name='conv2_fusion')
+        conv1,self.atten1 = self.multimodal_fusion(conv1a,64,  fusion_method,name='conv1_fusion')
+        with tf.device("/gpu:1"):
+            deconv1a = deconv3d_bn_relu(input=conv4, output_chn=256, channel_dim=self.chn_dim,
+                                        training=self.phase, name='deconv1a')
+            concat1 = tf.concat([deconv1a, conv3], axis=self.chn_dim, name='concat1')
+            deconv1b = conv3d_bn_relu(input=concat1, output_chn=256, kernel_size=1, stride=1, channel_dim=self.chn_dim,
+                                      use_bias=False, training=self.phase, name='deconv1b')
+            deconv1c = conv3d_bn_relu(input=deconv1b, output_chn=256, kernel_size=3, stride=1, channel_dim=self.chn_dim,
+                                      use_bias=False, training=self.phase, name='deconv1c')
+
+            deconv2a = deconv3d_bn_relu(input=deconv1c, output_chn=128, channel_dim=self.chn_dim,
+                                        training=self.phase, name='deconv2a')
+            concat2 = tf.concat([deconv2a, conv2], axis=self.chn_dim, name='concat2')
+            deconv2b = conv3d_bn_relu(input=concat2, output_chn=128, kernel_size=1, stride=1, channel_dim=self.chn_dim,
+                                      use_bias=False, training=self.phase, name='deconv2b')
+            deconv2c = conv3d_bn_relu(input=deconv2b, output_chn=128, kernel_size=3, stride=1, channel_dim=self.chn_dim,
+                                      use_bias=False, training=self.phase, name='deconv2c')
+
+        deconv3a = deconv3d_bn_relu(input=deconv2c, output_chn=64, channel_dim=self.chn_dim,
+                                    training=self.phase, name='deconv3a')
+        concat3 = tf.concat([deconv3a, conv1], axis=self.chn_dim, name='concat3')
+        deconv3b = conv3d_bn_relu(input=concat3, output_chn=64, kernel_size=1, stride=1, channel_dim=self.chn_dim,
+                                  use_bias=False, training=self.phase, name='deconv3b')
+        deconv3c = conv3d_bn_relu(input=deconv3b, output_chn=64, kernel_size=3, stride=1, channel_dim=self.chn_dim,
+                                  use_bias=False, training=self.phase, name='deconv3c')
+
+        with tf.device("/gpu:1"):
+            # auxiliary prediction 0
+            if self.up_feat:
+                aux0_deconv1 = deconv3d(input=deconv1c, output_chn=128, data_format=self.data_format, name='aux0_deconv1')
+                aux0_deconv1_relu = tf.nn.relu(aux0_deconv1, name='aux0_deconv1_relu')
+
+                aux0_deconv2 = deconv3d(input=aux0_deconv1_relu, output_chn=64, data_format=self.data_format,name='aux0_deconv2')
+                aux0_deconv2_relu = tf.nn.relu(aux0_deconv2, name='aux0_deconv2_relu')
+
+                aux0_logits = conv3d(input=aux0_deconv2_relu, output_chn=self.output_chn, kernel_size=1, stride=1,
+                                     data_format=self.data_format, use_bias=True, name='aux0_prob')
+            else:
+                aux0_logits = conv3d(input=deconv1c, output_chn=self.output_chn, kernel_size=1, stride=1,
+                                     data_format=self.data_format, use_bias=True, name='aux0_conv')
+                aux0_logits = deconv3d(input=aux0_logits, output_chn=self.output_chn, data_format=self.data_format,
+                                       use_bias=False, use_bilinear=True, name='aux0_prob_')
+                aux0_logits = deconv3d(input=aux0_logits, output_chn=self.output_chn,
+                                       data_format=self.data_format, use_bias=False, use_bilinear=True, name='aux0_prob')
+
+            # auxiliary prediction 1
+            if self.up_feat:
+                aux1_deconv1 = deconv3d(input=deconv2c, output_chn=64, data_format=self.data_format,name='aux1_deconv1')
+                aux1_deconv1_relu = tf.nn.relu(aux1_deconv1, name='aux1_deconv1_relu')
+
+                aux1_logits = conv3d(input=aux1_deconv1_relu, output_chn=self.output_chn, kernel_size=1, stride=1,
+                                     data_format=self.data_format, use_bias=True, name='aux1_prob')
+            else:
+                aux1_logits = conv3d(input=deconv2c, output_chn=self.output_chn, kernel_size=1, stride=1,
+                                     data_format=self.data_format, use_bias=True, name='aux1_conv')
+                aux1_logits = deconv3d(input=aux1_logits, output_chn=self.output_chn, data_format=self.data_format,
+                                       use_bias=False, use_bilinear=True, name='aux1_prob')
+        # predicted probability
+        main_logits = conv3d(input=deconv3c, output_chn=self.output_chn, kernel_size=1, stride=1,
+                             data_format=self.data_format, use_bias=True, name='pred_prob')
+
+        return [main_logits, aux1_logits, aux0_logits]
 
     def UNET(self):
         # downsample path
@@ -196,107 +642,8 @@ class Model(object):
                 aux1_logits = deconv3d(input=aux1_logits, output_chn=self.output_chn, data_format=self.data_format,
                                        use_bias=False, use_bilinear=True, name='aux1_prob')
 
-        return main_logits, aux0_logits, aux1_logits
+        return [main_logits, aux1_logits, aux0_logits]
 
-    def multimodal_fusion(self,feats, output_chn, method='concat',name=None):
-        with tf.variable_scope(name):
-            if method == 'concat':
-                atten_feats = tf.concat(feats, axis=self.chn_dim)
-            elif method=='attention':
-                inputs = tf.concat(feats, axis=self.chn_dim)
-                #attention1 = conv3d(inputs,256,3,1,self.data_format,name='attention1')
-                attention2 = conv3d(inputs,4,1,1,self.data_format,name='attention2')
-                soft = tf.nn.softmax(attention2,name='soft_attention')
-                #atten_feats = tf.tile(soft,(1,1,1,1,output_chn))*inputs
-                soft = tf.unstack(soft,axis=-1)
-                atten_feats = tf.concat([tf.expand_dims(w,-1)*feat for w,feat in zip(soft,feats)], axis=self.chn_dim)
-
-            return conv3d_bn_relu(atten_feats, output_chn, 1, 1, self.chn_dim, training=self.phase, name='conv')
-
-    def UNET_modality(self):
-        #downsample path
-        conv1a = [];pool1 = [];conv2a=[];pool2=[];conv3a=[];conv3b=[];pool3=[];conv4a=[];conv4b=[]
-        for m in range(4):
-            with tf.variable_scope('M{}'.format(m)):
-                conv1a.append(conv3d_bn_relu(self.input_I[:,:,:,:,m:m+1], 64, 3, 1, self.chn_dim, training=self.phase, name='conv1a'))
-                pool1.append(tf.layers.max_pooling3d(conv1a[m],2,2,data_format=self.data_format,name='pool1'))
-
-                conv2a.append(conv3d_bn_relu(pool1[m], 128, 3, 1, self.chn_dim, training=self.phase, name='conv2a'))
-                pool2.append(tf.layers.max_pooling3d(conv2a[m],2,2,data_format=self.data_format,name='pool2'))
-
-                conv3a.append(conv3d_bn_relu(pool2[m], 256, 3, 1, self.chn_dim, training=self.phase, name='conv3a'))
-                conv3b.append(conv3d_bn_relu(conv3a[m], 256, 3, 1, self.chn_dim, training=self.phase, name='conv3b'))
-                pool3.append(tf.layers.max_pooling3d(conv3b[m], 2, 2, data_format=self.data_format, name='pool3'))
-
-                conv4a.append(conv3d_bn_relu(pool3[m], 512, 3, 1, self.chn_dim, training=self.phase, name='conv4a'))
-                conv4b.append(conv3d_bn_relu(conv4a[m], 512, 3, 1, self.chn_dim, training=self.phase, name='conv4b'))
-
-        #upsample path
-        conv4 = self.multimodal_fusion(conv4b,512, method='attention',name='conv4_fusion')
-        conv3 = self.multimodal_fusion(conv3b,256, method='attention',name='conv3_fusion')
-        conv2 = self.multimodal_fusion(conv2a,128, method='attention',name='conv2_fusion')
-        conv1 = self.multimodal_fusion(conv1a,64,  method='attention',name='conv1_fusion')
-
-        deconv1a = deconv3d_bn_relu(input=conv4, output_chn=256, channel_dim=self.chn_dim,
-                                    training=self.phase, name='deconv1a')
-        concat1 = tf.concat([deconv1a, conv3], axis=self.chn_dim, name='concat1')
-        deconv1b = conv3d_bn_relu(input=concat1, output_chn=256, kernel_size=1, stride=1, channel_dim=self.chn_dim,
-                                  use_bias=False, training=self.phase, name='deconv1b')
-        deconv1c = conv3d_bn_relu(input=deconv1b, output_chn=256, kernel_size=3, stride=1, channel_dim=self.chn_dim,
-                                  use_bias=False, training=self.phase, name='deconv1c')
-
-        deconv2a = deconv3d_bn_relu(input=deconv1c, output_chn=128, channel_dim=self.chn_dim,
-                                    training=self.phase, name='deconv2a')
-        concat2 = tf.concat([deconv2a, conv2], axis=self.chn_dim, name='concat2')
-        deconv2b = conv3d_bn_relu(input=concat2, output_chn=128, kernel_size=1, stride=1, channel_dim=self.chn_dim,
-                                  use_bias=False, training=self.phase, name='deconv2b')
-        deconv2c = conv3d_bn_relu(input=deconv2b, output_chn=128, kernel_size=3, stride=1, channel_dim=self.chn_dim,
-                                  use_bias=False, training=self.phase, name='deconv2c')
-
-        deconv3a = deconv3d_bn_relu(input=deconv2c, output_chn=64, channel_dim=self.chn_dim,
-                                    training=self.phase, name='deconv3a')
-        concat3 = tf.concat([deconv3a, conv1], axis=self.chn_dim, name='concat3')
-        deconv3b = conv3d_bn_relu(input=concat3, output_chn=64, kernel_size=1, stride=1, channel_dim=self.chn_dim,
-                                  use_bias=False, training=self.phase, name='deconv3b')
-        deconv3c = conv3d_bn_relu(input=deconv3b, output_chn=64, kernel_size=3, stride=1, channel_dim=self.chn_dim,
-                                  use_bias=False, training=self.phase, name='deconv3c')
-
-        # predicted probability
-        main_logits = conv3d(input=deconv3c, output_chn=self.output_chn, kernel_size=1, stride=1,
-                             data_format=self.data_format, use_bias=True, name='pred_prob')
-
-        # auxiliary prediction 0
-        if self.up_feat:
-            aux0_deconv1 = deconv3d(input=deconv1c, output_chn=128, data_format=self.data_format, name='aux0_deconv1')
-            aux0_deconv1_relu = tf.nn.relu(aux0_deconv1, name='aux0_deconv1_relu')
-
-            aux0_deconv2 = deconv3d(input=aux0_deconv1_relu, output_chn=64, data_format=self.data_format,name='aux0_deconv2')
-            aux0_deconv2_relu = tf.nn.relu(aux0_deconv2, name='aux0_deconv2_relu')
-
-            aux0_logits = conv3d(input=aux0_deconv2_relu, output_chn=self.output_chn, kernel_size=1, stride=1,
-                                 data_format=self.data_format, use_bias=True, name='aux0_prob')
-        else:
-            aux0_logits = conv3d(input=deconv1c, output_chn=self.output_chn, kernel_size=1, stride=1,
-                                 data_format=self.data_format, use_bias=True, name='aux0_conv')
-            aux0_logits = deconv3d(input=aux0_logits, output_chn=self.output_chn, data_format=self.data_format,
-                                   use_bias=False, use_bilinear=True, name='aux0_prob_')
-            aux0_logits = deconv3d(input=aux0_logits, output_chn=self.output_chn,
-                                   data_format=self.data_format, use_bias=False, use_bilinear=True, name='aux0_prob')
-
-        # auxiliary prediction 1
-        if self.up_feat:
-            aux1_deconv1 = deconv3d(input=deconv2c, output_chn=64, data_format=self.data_format,name='aux1_deconv1')
-            aux1_deconv1_relu = tf.nn.relu(aux1_deconv1, name='aux1_deconv1_relu')
-
-            aux1_logits = conv3d(input=aux1_deconv1_relu, output_chn=self.output_chn, kernel_size=1, stride=1,
-                                 data_format=self.data_format, use_bias=True, name='aux1_prob')
-        else:
-            aux1_logits = conv3d(input=deconv2c, output_chn=self.output_chn, kernel_size=1, stride=1,
-                                 data_format=self.data_format, use_bias=True, name='aux1_conv')
-            aux1_logits = deconv3d(input=aux1_logits, output_chn=self.output_chn, data_format=self.data_format,
-                                   use_bias=False, use_bilinear=True, name='aux1_prob')
-
-        return main_logits, aux0_logits, aux1_logits
 
     def DenseNet(self, num_filter = 16,growth_rate = 12,num_layers = [12,12],dropout_rate = 0.2, compression=1.0):
         #Initial Conv 1 (conv0)
@@ -339,7 +686,7 @@ class Model(object):
             aux0_logits = deconv3d(input=aux0_logits, output_chn=self.output_chn,
                                    data_format=self.data_format, use_bias=False, use_bilinear=True, name='aux0_logits')
 
-        return main_logits, aux0_logits
+        return [main_logits, aux0_logits]
 
     # train function
     def train(self):
@@ -358,7 +705,7 @@ class Model(object):
         else:
             loss_log = open(os.path.join(self.model_path, 'loss.txt'), "w")
 
-        train_imgs, train_labels = load_data_pairs(self.traindata_dir, self.inputI_size, self.reset_h5,"train")
+        train_imgs, train_labels = load_data_pairs(self.traindata_dir, self.inputI_size, self.reset_h5,"train",all_data=True)
         val_imgs, val_labels = load_data_pairs(self.traindata_dir, self.inputI_size, self.reset_h5, "val")
         print "Total {} volumes for training".format(len(train_imgs))
         print "Total {} volumes for validation".format(len(val_imgs))
@@ -392,14 +739,14 @@ class Model(object):
                 self.summary_writer.add_summary(val_summary, iter)
                 self.summary_writer.add_summary(summary_str, iter)
 
-            if iter%3000 ==2999 or iter==self.iter_nums-1:
+            if iter%3000 ==0 or iter==self.iter_nums-1:
                 self.save_chkpoint(self.chkpoint_dir, self.model_name, iter)
 
         loss_log.close()
 
 
     # test the model
-    def test(self):
+    def test(self, method='vote',dataset='validation'):
         """Test 3D U-net"""
         init_op = tf.global_variables_initializer()
         self.sess.run(init_op)
@@ -409,19 +756,25 @@ class Model(object):
         if not os.path.exists(self.labeling_dir):
             os.makedirs(self.labeling_dir)
 
-        #pair_list = glob('{}/*/*/*_t1.nii.gz'.format(self.testdata_dir))
-        #pair_list.sort()
+        if dataset == 'validation':
+            pair_list = glob('{}/*/*/*_t1.nii.gz'.format(self.testdata_dir))
+            pair_list.sort()
 
-        pair_list = glob('{}/*/*/*_t1.nii.gz'.format(self.testdata_dir))
-        pair_list.sort()
+            division = pickle.load(open(os.path.join(self.testdata_dir, 'division.pkl'), 'rb'))
+            train_list, val_list = division
+            list = val_list
+        else:
+            pair_list = glob('{}/*/*_t1.nii.gz'.format("/home/lqyu/server/gpu8/BRATS2017/data/Brats17ValidationData"))
+            pair_list.sort()
 
-        division = pickle.load(open(os.path.join(self.testdata_dir, 'division.pkl'), 'rb'))
-        train_list, val_list = division
-        list = val_list
+            self.labeling_dir = '/home/lqyu/server/gpu8/BRATS2017/validation_result/'+self.labeling_dir.split('/')[-1]
+            if not os.path.exists(self.labeling_dir):
+                os.makedirs(self.labeling_dir)
+            list = None
 
         for id, T1_path in enumerate(pair_list):
             subject_name = T1_path[:-10]
-            if subject_name.split('/')[-1] not in list:
+            if list is not None and subject_name.split('/')[-1] not in list:
                 continue
 
             T1_path = subject_name + "_t1.nii.gz"
@@ -452,6 +805,7 @@ class Model(object):
 
             start_time = time.time()
             patch_results=[]
+            attention_results = []
             # cube_list = np.asarray(cube_list)
             # cube_labels = np.zeros((0, self.inputI_size, self.inputI_size, self.inputI_size)).astype('int16')
             # for i in range(0,cube_list.shape[0],8):
@@ -460,28 +814,40 @@ class Model(object):
             #     for tt in cube_label:
             #         cube_labels.append(tt)
             #     #cube_labels = np.concatenate((cube_labels,cube_label))
-            for patch in cube_list:
-                patch_result = self.sess.run(self.pred_label, feed_dict={self.input_I: np.expand_dims(patch,axis=0)})
-                patch_results.append(np.squeeze(patch_result))
-
-            # compose cubes into a volume
-            composed_label = compose_label_cube2vol_mvot(patch_results,self.inputI_size,img.shape,4,idx)
+            if method=='vote':
+                for patch in cube_list:
+                    patch_result = self.sess.run([self.pred_label], feed_dict={self.input_I: np.expand_dims(patch,axis=0)})
+                    patch_results.append(np.squeeze(patch_result))
+                composed_label = compose_label_cube2vol_mvot(patch_results,self.inputI_size,img.shape,4,idx)
+            else:
+                for patch in cube_list:
+                    patch_result = self.sess.run(self.pred_prob, feed_dict={self.input_I: np.expand_dims(patch,axis=0)})
+                    patch_results.append(np.squeeze(patch_result))
+                composed_label = compose_label_cube2vol_mean(patch_results,self.inputI_size,img.shape,4,idx)
             composed_label = composed_label.astype('int16')
             composed_label[composed_label == 3] = 4
+
             # remove minor connected components
             post_pred = post_prediction(composed_label)
             end_time = time.time()
             print "{}: {}".format(id, end_time - start_time)
 
             #save post processed prediction
-            labeling_path = os.path.join(self.labeling_dir, subject_name+'_seg.nii.gz')
+            if dataset == 'validation':
+                labeling_path = os.path.join(self.labeling_dir, subject_name+'_seg.nii.gz')
+            else:
+                labeling_path = os.path.join(self.labeling_dir, subject_name + '.nii.gz')
+
             labeling_vol = nib.Nifti1Image(post_pred, affine)
             nib.save(labeling_vol, labeling_path)
 
             #save original prediction
             if not os.path.exists(self.labeling_dir+"_ori"):
                 os.makedirs(self.labeling_dir+"_ori")
-            labeling_path = os.path.join(self.labeling_dir+"_ori", subject_name + '_seg.nii.gz')
+            if dataset == 'validation':
+                labeling_path = os.path.join(self.labeling_dir+"_ori", subject_name + '_seg.nii.gz')
+            else:
+                labeling_path = os.path.join(self.labeling_dir + "_ori", subject_name + '.nii.gz')
             labeling_vol = nib.Nifti1Image(composed_label, affine)
             nib.save(labeling_vol, labeling_path)
 

@@ -10,7 +10,7 @@ os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
 def main(_):
     # load training parameter #
-    model_path = "../model/UNet_feat_mm_attention"
+    model_path = "../model/new_UNet_feat_mm64_pool5_concat1_alldata"
     param_sets = load_train_ini(os.path.join(model_path,'ini','tr_param.ini'))
     param_set = param_sets[0]
     param_set['model_path'] = model_path
@@ -19,9 +19,11 @@ def main(_):
     param_set['reset_h5'] = False
     param_set['data_format'] = 'channels_last'
 
+    #param_set['traindata_dir'] = '/data/ssd/public/lqyu/BRATS2017/data/Brats17TrainingData'
+    #param_set['traindata_dir'] = '/home/lqyu/server/gpu8/BRATS2017/data/Brats17TrainingData'
     param_set['testdata_dir'] = '/home/lqyu/server/gpu8/BRATS2017/data/Brats17TrainingData'
-    param_set['labeling_dir'] = '/home/lqyu/server/gpu8/BRATS2017/result/UNet_feat_mm_attention'
-    param_set['phase'] = 'train'
+    param_set['labeling_dir'] = '/home/lqyu/server/gpu8/BRATS2017/result/new_UNet_feat_mm64_pool5_concat1_alldata'
+    param_set['phase'] = 'test'
 
     print '====== Parameters >>> %s <<< ======' % param_set['phase']
     print param_set
@@ -29,7 +31,7 @@ def main(_):
 
     # GPU setting, per_process_gpu_memory_fraction means 95% GPU MEM ,allow_growth means unfixed memory
     gpu_options = tf.GPUOptions(per_process_gpu_memory_fraction=0.95,allow_growth=True)
-    with tf.Session(config=tf.ConfigProto(gpu_options=gpu_options, allow_soft_placement=True)) as sess:
+    with tf.Session(config=tf.ConfigProto(allow_soft_placement=True)) as sess:
         model = Model(sess, param_set)
 
         if param_set['phase'] == 'train':
@@ -43,7 +45,7 @@ def main(_):
 
             model.train()
         elif param_set['phase'] == 'test':
-            model.test()
+            model.test('vote','test')
 
 if __name__ == '__main__':
     tf.app.run()

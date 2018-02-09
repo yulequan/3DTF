@@ -52,7 +52,7 @@ def load_test_data(testingdata_dir,reset_h5 = False):
     return img_clec,subject_names,affines
 
 
-def load_data_pairs(traindata_dir, patch_dim=64, reset_h5=False, phase='train'):
+def load_data_pairs(traindata_dir, patch_dim=64, reset_h5=False, phase='train',all_data = True):
     """load all volume pairs"""
     pair_list = glob('{}/*/*/*_seg.nii.gz'.format(traindata_dir))
     pair_list.sort()
@@ -74,6 +74,19 @@ def load_data_pairs(traindata_dir, patch_dim=64, reset_h5=False, phase='train'):
         for id in range(h5_size.shape[0]):
             img_clec.append(np.reshape(imgs[id],tuple(h5_size[id])+(4,)))
             label_clec.append(np.reshape(labels[id],tuple(h5_size[id])))
+
+        # add the val data if we use all data to train
+        if all_data and phase=='train':
+            print "also use val data to train"
+            file_disk = os.path.join(traindata_dir,'val_data.h5')
+            disk_buffer = h5py.File(file_disk, 'r')
+            h5_size = disk_buffer['size']
+            imgs = disk_buffer['img']
+            labels = disk_buffer['gt']
+
+            for id in range(h5_size.shape[0]):
+                img_clec.append(np.reshape(imgs[id], tuple(h5_size[id]) + (4,)))
+                label_clec.append(np.reshape(labels[id], tuple(h5_size[id])))
     else:
         disk_buffer = h5py.File(file_disk,'w')
         dt1 = h5py.special_dtype(vlen=np.dtype('float32'))

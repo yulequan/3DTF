@@ -8,7 +8,7 @@ import pickle
 
 def eval_model():
     testdata_dir = '/home/lqyu/server/gpu8/BRATS2017/data/Brats17TrainingData'
-    labeling_dir = '/home/lqyu/server/gpu8/BRATS2017/result/UNet_feat_simple'
+    labeling_dir = '/home/lqyu/server/gpu8/BRATS2017/result/UNet_feat_mm32_concat1_medianweight'
 
     pair_list = glob('{}/*/*/*_seg.nii.gz'.format(testdata_dir))
     pair_list.sort()
@@ -29,7 +29,7 @@ def eval_model():
         pred_path = os.path.join(labeling_dir, seg_path.split('/')[-1])
         pred = nib.load(pred_path).get_data()
         m = eval_result(pred, gt)
-        print m
+        print subject_name.split('/')[-3:], m
         results.append(m)
         end = time.time()
         #print end-start
